@@ -1,26 +1,16 @@
 import { buildConstructionFunding } from './construction';
 import { buildCovenants } from './covenants';
-import { allocateDebt, buildDebtSchedules } from './debt';
+import { buildDebtSchedules } from './debt';
 import { bullet, dscr, irr, sculpted, sizeByDSCR, sizeByGearing, straightLine, sum } from './finance';
 import { buildOperatingModel } from './operating';
 import { buildDsra } from './reserves';
 import { buildStatements } from './statements';
 import { generateTimeline } from './timeline';
-import { FundingSummary, ModelResults, ProjectModel, SolverLogEntry, SourcesUsesLine } from './types';
+import { ModelResults, ProjectModel, SolverLogEntry } from './types';
 import { validateProject } from './validation';
 
 export { validateProject } from './validation';
 export { bullet, dscr, sculpted, sizeByDSCR, sizeByGearing, straightLine } from './finance';
-
-function buildSourcesUses(summary: FundingSummary): SourcesUsesLine[] {
-  return [
-    ...Object.entries(summary.usesBreakdown).map(([label, amount]) => ({ section: 'Uses' as const, label, amount })),
-    { section: 'Uses' as const, label: 'Total Uses / Final Project Cost', amount: summary.totalUses },
-    ...Object.entries(summary.sourcesBreakdown).map(([label, amount]) => ({ section: 'Sources' as const, label, amount })),
-    { section: 'Sources' as const, label: 'Total Sources', amount: summary.totalSources },
-    { section: 'Check' as const, label: summary.balanced ? 'Balanced' : 'Not balanced', amount: summary.sourcesUsesDifference },
-  ];
-}
 
 export function calculateModel(project: ProjectModel): ModelResults {
   const audit: string[] = [];
@@ -30,101 +20,27 @@ export function calculateModel(project: ProjectModel): ModelResults {
   const operating = buildOperatingModel(project, periods);
   const construction = buildConstructionFunding(project, periods);
   const lcCommitment = sum(project.instruments.filter(i => i.enabled && i.type === 'DSRA LC').map(i => i.commitment));
-  const grantAmount = sum(project.instruments.filter(i => i.enabled && i.type === 'Grant / subsidy').map(i => i.commitment));
-  const tolerance = project.funding.tolerance || 1;
-  let estimatedTotalUses = construction.totalCapex;
-  let debtAllocation: Record<string, number> = {};
-  let targetDebt = 0;
-  let debtSchedules = buildDebtSchedules(project, periods, operating.cfadsBeforeDebt, debtAllocation);
+  const grantsTotal = sum(project.instruments.filter(i => i.enabled && i.type === 'Grant / subsidy').map(i => i.commitment));
+  let previousCircularDebt = 0;
+  let finalDelta = Infinity;
+  const log: SolverLogEntry[] = [];
+  let debtSchedules = buildDebtSchedules(project, periods, operating.cfadsBeforeDebt, construction.draw, 0);
   let debtService = periods.map((_, i) => sum(debtSchedules.map(d => d.interest[i] + d.principal[i] + d.cashSweep[i])));
   let reserveSchedule = buildDsra(project, debtService, lcCommitment);
-  const log: SolverLogEntry[] = [];
-  let finalDelta = Infinity;
-  let fundingSummary: FundingSummary = {
-    baseCapex: construction.totalCapex,
-    financingCosts: 0,
-    totalUses: construction.totalCapex,
-    totalSources: construction.totalCapex,
-    targetDebt: 0,
-    equityFunding: Math.max(0, construction.totalCapex - grantAmount),
-    grants: grantAmount,
-    sourcesUsesDifference: 0,
-    balanced: true,
-    debtAllocation: {},
-    usesBreakdown: {},
-    sourcesBreakdown: {},
-  };
 
-  for (let iteration = 1; iteration <= 100; iteration += 1) {
-    const allocation = allocateDebt(project, estimatedTotalUses);
-    targetDebt = allocation.targetDebt;
-    debtAllocation = allocation.allocation;
-    debtSchedules = buildDebtSchedules(project, periods, operating.cfadsBeforeDebt, debtAllocation);
+  for (let iteration = 1; iteration <= 80; iteration += 1) {
+    const debtFundedDsra = project.reserves.find(r => r.type === 'DSRA')?.funding === 'debt funded' ? Math.max(...reserveSchedule.closingBalance, 0) : 0;
+    debtSchedules = buildDebtSchedules(project, periods, operating.cfadsBeforeDebt, construction.draw, debtFundedDsra);
     debtService = periods.map((_, i) => sum(debtSchedules.map(d => d.interest[i] + d.principal[i] + d.cashSweep[i])));
     reserveSchedule = buildDsra(project, debtService, lcCommitment);
-    const capitalizedInterest = sum(debtSchedules.map(d => sum(d.capitalizedInterest)));
-    const enabledDebt = project.instruments.filter(i => i.enabled && debtAllocation[i.id] !== undefined);
-    const upfrontFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.upfrontFee));
-    const arrangementFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.arrangementFee));
-    const commitmentFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.commitmentFee));
-    const agencyFees = sum(enabledDebt.map(i => i.agencyFee));
-    const undrawnFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.undrawnFee));
-    const financingFees = upfrontFees + arrangementFees + commitmentFees + agencyFees + undrawnFees;
-    const dsraFunding = Math.max(...reserveSchedule.closingBalance, 0);
-    const financingCosts = capitalizedInterest + financingFees + dsraFunding;
-    const totalUses = construction.totalCapex + financingCosts;
-    const totalDebt = sum(Object.values(debtAllocation));
-    const equityFunding = Math.max(0, totalUses - totalDebt - grantAmount);
-    const totalSources = totalDebt + equityFunding + grantAmount;
-    const sourcesUsesDifference = totalSources - totalUses;
-    finalDelta = Math.max(Math.abs(totalUses - estimatedTotalUses), Math.abs(sourcesUsesDifference));
-    fundingSummary = {
-      baseCapex: construction.totalCapex,
-      financingCosts,
-      totalUses,
-      totalSources,
-      targetDebt,
-      equityFunding,
-      grants: grantAmount,
-      sourcesUsesDifference,
-      balanced: Math.abs(sourcesUsesDifference) <= tolerance,
-      debtAllocation,
-      usesBreakdown: {
-        'Base CAPEX / Base Project Cost': project.construction.capex,
-        Contingency: project.construction.contingency,
-        'Cost overrun reserve': project.construction.costOverrunReserve,
-        IDC: capitalizedInterest,
-        'Capitalized interest': 0,
-        'Upfront fees': upfrontFees,
-        'Arrangement fees': arrangementFees,
-        'Commitment fees': commitmentFees,
-        'Agency fees': agencyFees,
-        'Undrawn fees': undrawnFees,
-        'Debt-funded fees': financingFees,
-        'DSRA funding': dsraFunding,
-        'Other financing costs': 0,
-      },
-      sourcesBreakdown: {
-        Equity: equityFunding,
-        'Shareholder loan': sum(debtSchedules.filter(d => d.type === 'Shareholder loan').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'Senior debt': sum(debtSchedules.filter(d => d.type === 'Senior debt').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'Mezzanine debt': sum(debtSchedules.filter(d => d.type === 'Mezzanine debt').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'Bridge loan': sum(debtSchedules.filter(d => d.type === 'Bridge loan').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'ECA facility': sum(debtSchedules.filter(d => d.type === 'ECA facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'IFI / DFI facility': sum(debtSchedules.filter(d => d.type === 'IFI / DFI facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'VAT facility': sum(debtSchedules.filter(d => d.type === 'VAT facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'Working capital facility': sum(debtSchedules.filter(d => d.type === 'Working capital facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'Refinancing debt': sum(debtSchedules.filter(d => d.type === 'Refinancing debt').map(d => debtAllocation[d.instrumentId] ?? 0)),
-        'Grants / subsidies': grantAmount,
-        'Other sources': 0,
-      },
-    };
-    log.push({ iteration, variable: 'funding circularity', previous: estimatedTotalUses, next: totalUses, delta: finalDelta, note: finalDelta <= tolerance ? 'converged' : 'recalculate debt sizing and financing costs', baseCapex: construction.totalCapex, financingCosts, totalUses, targetDebt, debtAllocation: { ...debtAllocation }, equityFunding, sourcesUsesDifference });
-    estimatedTotalUses = estimatedTotalUses * 0.25 + totalUses * 0.75;
-    if (finalDelta <= tolerance) break;
+    const circularDebt = sum(debtSchedules.map(d => Math.max(...d.closingBalance, 0)));
+    finalDelta = Math.abs(circularDebt - previousCircularDebt);
+    log.push({ iteration, variable: 'IDC / fees / DSRA / sculpted repayment', previous: previousCircularDebt, next: circularDebt, delta: finalDelta, note: finalDelta < 1 ? 'converged' : 'recalculate circular debt-funded uses' });
+    if (finalDelta < 1) break;
+    previousCircularDebt = previousCircularDebt * 0.35 + circularDebt * 0.65;
   }
 
-  const failed = finalDelta > tolerance;
+  const failed = finalDelta >= 1;
   const interest = periods.map((_, i) => sum(debtSchedules.map(d => d.interest[i])));
   const principal = periods.map((_, i) => sum(debtSchedules.map(d => d.principal[i] + d.cashSweep[i])));
   const fees = periods.map((_, i) => sum(debtSchedules.map(d => d.fees[i])));
@@ -134,9 +50,12 @@ export function calculateModel(project: ProjectModel): ModelResults {
   const cfads = operating.cfadsBeforeDebt;
   const covenants = buildCovenants(project, cfads, principal.map((p, i) => p + interest[i]), closingDebt);
   const dsra = reserveSchedule.closingBalance;
-  const constructionCount = periods.filter(p => p.phase === 'construction').length || 1;
-  const grantContrib = periods.map(p => p.phase === 'construction' ? grantAmount / constructionCount : 0);
-  const equityContrib = periods.map(p => p.phase === 'construction' ? fundingSummary.equityFunding / constructionCount : 0);
+  const grantContrib = periods.map((p, i) => p.phase === 'construction' ? grantsTotal / Math.max(1, periods.filter(x => x.phase === 'construction').length) : 0);
+  const totalFundingNeed = periods.map((_, i) => construction.draw[i] + fees[i] + idc[i] + reserveSchedule.topUp[i] - reserveSchedule.release[i]);
+  const equityInst = project.instruments.find(i => i.enabled && i.type === 'Equity');
+  const equityContrib = totalFundingNeed.map((need, i) => Math.max(0, need - debtDraws[i] - grantContrib[i]));
+  if (equityInst && sum(equityContrib) > equityInst.commitment) validation.push({ severity: 'warning', message: 'Minimum equity contribution exceeds enabled equity commitment.' });
+
   const distributions: number[] = [];
   const closingCash: number[] = [];
   let cash = 0;
@@ -151,17 +70,26 @@ export function calculateModel(project: ProjectModel): ModelResults {
   const statements = buildStatements({ periods, revenue: operating.revenue, operatingCosts: operating.operatingCosts, ebitda: operating.ebitda, depreciation: operating.depreciation, interest, tax: operating.tax, maintenance: operating.maintenanceCapex, wc: operating.workingCapital, constructionDraw: construction.draw, debtSchedules, dsra, distributions, closingCash, equityContrib, grants: grantContrib });
   const dscrs = dscr(cfads, principal.map((p, i) => p + interest[i]));
   const finiteDscr = dscrs.filter(Number.isFinite);
-  const totalDebt = sum(Object.values(fundingSummary.debtAllocation));
+  const totalDebt = sum(debtDraws);
   const totalFees = sum(fees);
   const totalIdc = sum(idc);
+  const totalUses = construction.totalCapex + totalFees + totalIdc + Math.max(...dsra, 0);
+  const totalSources = totalDebt + sum(equityContrib) + sum(grantContrib);
   const balanceSheetBalanced = statements.balanceCheck.every(x => Math.abs(x) < 1.5);
   const warnings = [
     ...validation.filter(v => v.severity === 'warning').map(v => v.message),
-    ...(failed ? ['Funding circularity solver failure.'] : []),
-    ...(!fundingSummary.balanced ? ['Sources and uses are not balanced.'] : []),
+    ...(failed ? ['Circularity solver failure.'] : []),
     ...(!balanceSheetBalanced ? ['Balance sheet not balancing.'] : []),
   ];
-  const sourcesUses = buildSourcesUses(fundingSummary);
+  const sourcesUses = [
+    { source: 'Total debt drawdowns', amount: totalDebt },
+    { source: 'Equity requirement', amount: sum(equityContrib) },
+    { source: 'Grants / subsidies', amount: sum(grantContrib) },
+    { source: 'Uses: construction capex', amount: construction.totalCapex },
+    { source: 'Uses: IDC', amount: totalIdc },
+    { source: 'Uses: financing fees', amount: totalFees },
+    { source: 'Uses: DSRA cash balance', amount: Math.max(...dsra, 0) },
+  ];
   const waterfall = {
     Revenue: operating.revenue,
     'Operating costs': operating.operatingCosts.map(x => -x),
@@ -204,9 +132,8 @@ export function calculateModel(project: ProjectModel): ModelResults {
     llcr: Math.min(...covenants.llcr.filter(Number.isFinite), Infinity),
     plcr: Math.min(...covenants.plcr.filter(Number.isFinite), Infinity),
     projectIrr: irr([-construction.totalCapex, ...cfads]),
-    equityIrr: irr([-Math.max(1, fundingSummary.equityFunding), ...distributions]),
+    equityIrr: irr([-Math.max(1, sum(equityContrib)), ...distributions]),
     sourcesUses,
-    fundingSummary,
     incomeStatement: statements.incomeStatement,
     balanceSheet: statements.balanceSheet,
     cashFlowStatement: statements.cashFlowStatement,
@@ -214,11 +141,11 @@ export function calculateModel(project: ProjectModel): ModelResults {
     debtSchedules,
     reserveSchedule,
     covenants,
-    solver: { status: failed ? 'failed' : 'converged', iterations: log.length, tolerance, finalDelta, variables: ['Base CAPEX', 'Total uses', 'Target gearing debt', 'Debt allocation', 'IDC', 'Debt-funded fees', 'DSRA funding', 'Equity residual', 'Sources-uses balance'], bindingConstraint: `${(project.funding.targetGearing * 100).toFixed(1)}% target gearing on total uses`, failureReason: failed ? 'Funding circularity not converging; review gearing, fees, DSRA and debt allocation caps.' : undefined, warnings, log },
+    solver: { status: failed ? 'failed' : 'converged', iterations: log.length, tolerance: 1, finalDelta, variables: ['Debt-funded IDC', 'Capitalized interest', 'Debt-funded fees', 'DSRA funding', 'Sculpted repayment', 'Cash sweep', 'Restricted distributions'], bindingConstraint: project.instruments.find(i => i.enabled && i.type === 'Senior debt')?.sizingMethod, failureReason: failed ? 'Circularity not converging; review gearing, tenor, interest rates and CFADS.' : undefined, warnings, log },
     validation,
     warnings,
     balanceCheck: statements.balanceCheck,
-    dashboard: { totalSources: fundingSummary.totalSources, totalUses: fundingSummary.totalUses, totalDebt, equityRequirement: fundingSummary.equityFunding, idc: totalIdc, fees: totalFees, dsra: Math.max(...dsra, 0), minDSCR: finiteDscr.length ? Math.min(...finiteDscr) : Infinity, avgDSCR: finiteDscr.length ? sum(finiteDscr) / finiteDscr.length : Infinity, llcr: Math.min(...covenants.llcr.filter(Number.isFinite), Infinity), plcr: Math.min(...covenants.plcr.filter(Number.isFinite), Infinity), projectIrr: irr([-construction.totalCapex, ...cfads]), equityIrr: irr([-Math.max(1, fundingSummary.equityFunding), ...distributions]), balanceSheetBalanced },
+    dashboard: { totalSources, totalUses, totalDebt, equityRequirement: sum(equityContrib), idc: totalIdc, fees: totalFees, dsra: Math.max(...dsra, 0), minDSCR: finiteDscr.length ? Math.min(...finiteDscr) : Infinity, avgDSCR: finiteDscr.length ? sum(finiteDscr) / finiteDscr.length : Infinity, llcr: Math.min(...covenants.llcr.filter(Number.isFinite), Infinity), plcr: Math.min(...covenants.plcr.filter(Number.isFinite), Infinity), projectIrr: irr([-construction.totalCapex, ...cfads]), equityIrr: irr([-Math.max(1, sum(equityContrib)), ...distributions]), balanceSheetBalanced },
     audit,
   };
 }
