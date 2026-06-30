@@ -1,6 +1,224 @@
-import { generateTimeline, periodsPerYear } from './timeline';
-import { FundingInstrument, ModelResults, ProjectModel, SolverLogEntry } from './types';
+import { buildConstructionFunding } from './construction';
+import { buildCovenants } from './covenants';
+import { allocateDebt, buildDebtSchedules } from './debt';
 import { bullet, dscr, irr, sculpted, sizeByDSCR, sizeByGearing, straightLine, sum } from './finance';
-export function validateProject(p:ProjectModel){const w:string[]=[]; if(new Date(p.timeline.constructionStart)<new Date(p.timeline.projectStart))w.push('Construction start is before project start.'); if(new Date(p.timeline.cod)<=new Date(p.timeline.constructionStart))w.push('COD must be after construction start.'); if(new Date(p.timeline.operationEnd)<=new Date(p.timeline.cod))w.push('Operation end must be after COD.'); p.instruments.filter(i=>i.enabled).forEach(i=>{if(i.commitment<0)w.push(`${i.name}: negative commitment is not allowed.`); if(i.type!=='Equity'&&i.type!=='Grant / subsidy'&&i.fixedRate+i.baseRate+i.margin<=0)w.push(`${i.name}: missing interest rate.`); if(!i.sizingMethod)w.push(`${i.name}: funding source without sizing method.`);}); if(!p.covenants.backwardDSCR||!p.covenants.forwardDSCR)w.push('Covenant thresholds missing.'); return w;}
-function rate(inst:FundingInstrument, py:number){return (inst.interestType==='fixed'?inst.fixedRate:inst.baseRate+inst.margin)/py;}
-export function calculateModel(project:ProjectModel):ModelResults{const periods=generateTimeline(project.timeline);const py=periodsPerYear(project.timeline.frequency);const active=project.scenarios.find(s=>s.id===project.activeScenarioId)??project.scenarios[0];const op=periods.map(p=>p.phase==='operation');const revenue=op.map(x=>x?project.operating.revenue*(active?.revenueMultiplier??1)/py:0);const operatingCosts=op.map(x=>x?project.operating.operatingCost*(active?.opexMultiplier??1)/py:0);const ebitda=revenue.map((r,i)=>r-operatingCosts[i]);const tax=ebitda.map(e=>Math.max(0,e*project.operating.taxRate));const maintenance=op.map(x=>x?project.operating.maintenanceCapex/py:0);const wc=op.map(x=>x?project.operating.workingCapitalMovement/py:0);const cfads=ebitda.map((e,i)=>e-tax[i]-maintenance[i]-wc[i]);const constructionPeriods=periods.filter(p=>p.phase==='construction').length;const capex=(project.construction.capex*(active?.capexMultiplier??1)+project.construction.contingency+project.construction.costOverrunReserve);const capexDraw=periods.map((_,i)=>i<constructionPeriods?capex/constructionPeriods:0);const debtInst=project.instruments.filter(i=>i.enabled&&!['Equity','Grant / subsidy','DSRA LC'].includes(i.type));const senior=debtInst[0];const r=senior?rate(senior,py)+(active?.rateShock??0)/py:0;const dsraTarget=(project.reserves.find(r=>r.type==='DSRA')?.months??6)/12*sum(cfads.slice(constructionPeriods,constructionPeriods+Math.ceil(py)))/py;let debt=sizeByGearing(capex+dsraTarget,senior?.maxGearing??0.65,senior?.commitment??Infinity); if(senior?.sizingMethod.includes('DSCR')) debt=Math.min(debt,sizeByDSCR(cfads.slice(constructionPeriods),r,senior.targetDSCR||1.3));const feesRate=(senior?.upfrontFee??0)+(senior?.arrangementFee??0);let openingDebt=debt, finalDelta=Infinity;const log:SolverLogEntry[]=[];for(let it=1;it<=60;it++){const idc=openingDebt*r*Math.max(1,constructionPeriods)/2;const fees=openingDebt*feesRate;const nextDebt=debt+(senior?.capitalizedInterest?idc:0)+(senior?.debtFundedFees?fees:0)+dsraTarget;finalDelta=Math.abs(nextDebt-openingDebt);log.push({iteration:it,variable:'debt-funded IDC / fees / DSRA',previous:openingDebt,next:nextDebt,delta:finalDelta,note:finalDelta<1e-4?'converged':'recalculate debt-funded circular uses'});openingDebt=0.55*openingDebt+0.45*nextDebt;if(finalDelta<1e-4)break;}const failed=finalDelta>=1e-4;const ops=periods.length-constructionPeriods;let principalOps:number[]=[];if(senior?.repaymentType==='Bullet')principalOps=bullet(openingDebt,ops);else if(senior?.repaymentType==='Sculpted repayment')principalOps=sculpted(cfads.slice(constructionPeriods),senior.targetDSCR||1.3,openingDebt,r);else principalOps=straightLine(openingDebt,ops);const principal=periods.map((_,i)=>i<constructionPeriods?0:principalOps[i-constructionPeriods]??0);const interest:number[]=[];const closingDebt:number[]=[];let bal=0;for(let i=0;i<periods.length;i++){if(i<constructionPeriods) bal+=openingDebt/constructionPeriods;interest[i]=bal*r;bal=Math.max(0,bal-principal[i]);closingDebt[i]=bal;}const debtService=principal.map((p,i)=>p+interest[i]);const dscrs=dscr(cfads,debtService);const dsra=debtService.map((_,i)=>sum(debtService.slice(i+1,i+1+Math.round((project.reserves[0]?.months??6)/12*py))));let cash=0;const distributions:number[]=[],closingCash:number[]=[];for(let i=0;i<periods.length;i++){cash+=cfads[i]-debtService[i];const restricted=periods[i].phase==='construction'||dscrs[i]<(project.covenants.backwardDSCR||1.2)||cash<project.covenants.minimumCash;distributions[i]=restricted?0:Math.max(0,cash-project.covenants.minimumCash);cash-=distributions[i];closingCash[i]=cash;}const depreciation=op.map(x=>x?project.operating.depreciation/py:0);const is={Revenue:revenue,'Operating costs':operatingCosts,EBITDA:ebitda,Depreciation:depreciation,EBIT:ebitda.map((e,i)=>e-depreciation[i]),'Interest expense':interest,'Profit before tax':ebitda.map((e,i)=>e-depreciation[i]-interest[i]),Tax:tax,'Net income':ebitda.map((e,i)=>e-depreciation[i]-interest[i]-tax[i])};const retained:number[]=[];let re=0;is['Net income'].forEach((n,i)=>{re+=n-distributions[i];retained[i]=re});const bs={'Fixed assets':periods.map((_,i)=>sum(capexDraw.slice(0,i+1))),'Accumulated depreciation':depreciation.map((_,i)=>sum(depreciation.slice(0,i+1))),'Net fixed assets':periods.map((_,i)=>sum(capexDraw.slice(0,i+1))-sum(depreciation.slice(0,i+1))),Cash:closingCash,DSRA:dsra,'Other reserves':periods.map(()=>0),'Senior debt':closingDebt,'Mezzanine debt':periods.map(()=>0),'Shareholder loan':periods.map(()=>0),Equity:periods.map(()=>capex-openingDebt),'Retained earnings':retained};const balanceCheck=periods.map((_,i)=>bs['Net fixed assets'][i]+bs.Cash[i]+bs.DSRA[i]-(bs['Senior debt'][i]+bs.Equity[i]+bs['Retained earnings'][i]));return{periods,revenue,operatingCosts,ebitda,cfads,debtDraws:capexDraw,fees:periods.map((_,i)=>i<constructionPeriods?openingDebt*feesRate/constructionPeriods:0),idc:periods.map((_,i)=>i<constructionPeriods?interest[i]:0),principal,interest,closingDebt,dsra,distributions,closingCash,dscr:dscrs,llcr:sizeByDSCR(cfads.slice(constructionPeriods),r,1)/Math.max(1,openingDebt),plcr:sum(cfads)/Math.max(1,openingDebt),projectIrr:irr([-capex,...cfads]),equityIrr:irr([-(capex-openingDebt),...distributions]),sourcesUses:[{source:'Debt',amount:openingDebt},{source:'Equity / grants',amount:capex-openingDebt},{source:'Uses: capex, fees, IDC, DSRA',amount:capex+sum(interest.slice(0,constructionPeriods))+sum(dsra.slice(0,1))}],incomeStatement:is,balanceSheet:bs,cashFlowStatement:{'Cash flow from operations':cfads,'Cash flow from investing':capexDraw.map(x=>-x),'Cash flow from financing':principal.map((p,i)=>(i<constructionPeriods?openingDebt/constructionPeriods:0)-p-distributions[i]),'Net change in cash':closingCash.map((c,i)=>c-(closingCash[i-1]??0)),'Opening cash':closingCash.map((_,i)=>closingCash[i-1]??0),'Closing cash':closingCash},solver:{status:failed?'failed':'converged',iterations:log.length,tolerance:1e-4,finalDelta,variables:['IDC','debt-funded fees','DSRA funding','sculpted debt service','cash sweep','restricted distributions','refinancing sizing'],bindingConstraint:senior?.sizingMethod,failureReason:failed?'Circularity not converging within maximum iterations; check gearing, tenor, interest rate and CFADS.':undefined,log},warnings:[...validateProject(project),...(failed?['Circularity solver failure.']:[]),...(balanceCheck.some(x=>Math.abs(x)>1)?['Broken balance sheet check.']:[] )],balanceCheck};}
+import { buildOperatingModel } from './operating';
+import { buildDsra } from './reserves';
+import { buildStatements } from './statements';
+import { generateTimeline } from './timeline';
+import { FundingSummary, ModelResults, ProjectModel, SolverLogEntry, SourcesUsesLine } from './types';
+import { validateProject } from './validation';
+
+export { validateProject } from './validation';
+export { bullet, dscr, sculpted, sizeByDSCR, sizeByGearing, straightLine } from './finance';
+
+function buildSourcesUses(summary: FundingSummary): SourcesUsesLine[] {
+  return [
+    ...Object.entries(summary.usesBreakdown).map(([label, amount]) => ({ section: 'Uses' as const, label, amount })),
+    { section: 'Uses' as const, label: 'Total Uses / Final Project Cost', amount: summary.totalUses },
+    ...Object.entries(summary.sourcesBreakdown).map(([label, amount]) => ({ section: 'Sources' as const, label, amount })),
+    { section: 'Sources' as const, label: 'Total Sources', amount: summary.totalSources },
+    { section: 'Check' as const, label: summary.balanced ? 'Balanced' : 'Not balanced', amount: summary.sourcesUsesDifference },
+  ];
+}
+
+export function calculateModel(project: ProjectModel): ModelResults {
+  const audit: string[] = [];
+  const periods = generateTimeline(project.timeline);
+  audit.push(`Generated ${periods.length} ${project.timeline.frequency} periods.`);
+  const validation = validateProject(project);
+  const operating = buildOperatingModel(project, periods);
+  const construction = buildConstructionFunding(project, periods);
+  const lcCommitment = sum(project.instruments.filter(i => i.enabled && i.type === 'DSRA LC').map(i => i.commitment));
+  const grantAmount = sum(project.instruments.filter(i => i.enabled && i.type === 'Grant / subsidy').map(i => i.commitment));
+  const tolerance = project.funding.tolerance || 1;
+  let estimatedTotalUses = construction.totalCapex;
+  let debtAllocation: Record<string, number> = {};
+  let targetDebt = 0;
+  let debtSchedules = buildDebtSchedules(project, periods, operating.cfadsBeforeDebt, debtAllocation);
+  let debtService = periods.map((_, i) => sum(debtSchedules.map(d => d.interest[i] + d.principal[i] + d.cashSweep[i])));
+  let reserveSchedule = buildDsra(project, debtService, lcCommitment);
+  const log: SolverLogEntry[] = [];
+  let finalDelta = Infinity;
+  let fundingSummary: FundingSummary = {
+    baseCapex: construction.totalCapex,
+    financingCosts: 0,
+    totalUses: construction.totalCapex,
+    totalSources: construction.totalCapex,
+    targetDebt: 0,
+    equityFunding: Math.max(0, construction.totalCapex - grantAmount),
+    grants: grantAmount,
+    sourcesUsesDifference: 0,
+    balanced: true,
+    debtAllocation: {},
+    usesBreakdown: {},
+    sourcesBreakdown: {},
+  };
+
+  for (let iteration = 1; iteration <= 100; iteration += 1) {
+    const allocation = allocateDebt(project, estimatedTotalUses);
+    targetDebt = allocation.targetDebt;
+    debtAllocation = allocation.allocation;
+    debtSchedules = buildDebtSchedules(project, periods, operating.cfadsBeforeDebt, debtAllocation);
+    debtService = periods.map((_, i) => sum(debtSchedules.map(d => d.interest[i] + d.principal[i] + d.cashSweep[i])));
+    reserveSchedule = buildDsra(project, debtService, lcCommitment);
+    const capitalizedInterest = sum(debtSchedules.map(d => sum(d.capitalizedInterest)));
+    const enabledDebt = project.instruments.filter(i => i.enabled && debtAllocation[i.id] !== undefined);
+    const upfrontFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.upfrontFee));
+    const arrangementFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.arrangementFee));
+    const commitmentFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.commitmentFee));
+    const agencyFees = sum(enabledDebt.map(i => i.agencyFee));
+    const undrawnFees = sum(enabledDebt.map(i => (debtAllocation[i.id] ?? 0) * i.undrawnFee));
+    const financingFees = upfrontFees + arrangementFees + commitmentFees + agencyFees + undrawnFees;
+    const dsraFunding = Math.max(...reserveSchedule.closingBalance, 0);
+    const financingCosts = capitalizedInterest + financingFees + dsraFunding;
+    const totalUses = construction.totalCapex + financingCosts;
+    const totalDebt = sum(Object.values(debtAllocation));
+    const equityFunding = Math.max(0, totalUses - totalDebt - grantAmount);
+    const totalSources = totalDebt + equityFunding + grantAmount;
+    const sourcesUsesDifference = totalSources - totalUses;
+    finalDelta = Math.max(Math.abs(totalUses - estimatedTotalUses), Math.abs(sourcesUsesDifference));
+    fundingSummary = {
+      baseCapex: construction.totalCapex,
+      financingCosts,
+      totalUses,
+      totalSources,
+      targetDebt,
+      equityFunding,
+      grants: grantAmount,
+      sourcesUsesDifference,
+      balanced: Math.abs(sourcesUsesDifference) <= tolerance,
+      debtAllocation,
+      usesBreakdown: {
+        'Base CAPEX / Base Project Cost': project.construction.capex,
+        Contingency: project.construction.contingency,
+        'Cost overrun reserve': project.construction.costOverrunReserve,
+        IDC: capitalizedInterest,
+        'Capitalized interest': 0,
+        'Upfront fees': upfrontFees,
+        'Arrangement fees': arrangementFees,
+        'Commitment fees': commitmentFees,
+        'Agency fees': agencyFees,
+        'Undrawn fees': undrawnFees,
+        'Debt-funded fees': financingFees,
+        'DSRA funding': dsraFunding,
+        'Other financing costs': 0,
+      },
+      sourcesBreakdown: {
+        Equity: equityFunding,
+        'Shareholder loan': sum(debtSchedules.filter(d => d.type === 'Shareholder loan').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'Senior debt': sum(debtSchedules.filter(d => d.type === 'Senior debt').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'Mezzanine debt': sum(debtSchedules.filter(d => d.type === 'Mezzanine debt').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'Bridge loan': sum(debtSchedules.filter(d => d.type === 'Bridge loan').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'ECA facility': sum(debtSchedules.filter(d => d.type === 'ECA facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'IFI / DFI facility': sum(debtSchedules.filter(d => d.type === 'IFI / DFI facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'VAT facility': sum(debtSchedules.filter(d => d.type === 'VAT facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'Working capital facility': sum(debtSchedules.filter(d => d.type === 'Working capital facility').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'Refinancing debt': sum(debtSchedules.filter(d => d.type === 'Refinancing debt').map(d => debtAllocation[d.instrumentId] ?? 0)),
+        'Grants / subsidies': grantAmount,
+        'Other sources': 0,
+      },
+    };
+    log.push({ iteration, variable: 'funding circularity', previous: estimatedTotalUses, next: totalUses, delta: finalDelta, note: finalDelta <= tolerance ? 'converged' : 'recalculate debt sizing and financing costs', baseCapex: construction.totalCapex, financingCosts, totalUses, targetDebt, debtAllocation: { ...debtAllocation }, equityFunding, sourcesUsesDifference });
+    estimatedTotalUses = estimatedTotalUses * 0.25 + totalUses * 0.75;
+    if (finalDelta <= tolerance) break;
+  }
+
+  const failed = finalDelta > tolerance;
+  const interest = periods.map((_, i) => sum(debtSchedules.map(d => d.interest[i])));
+  const principal = periods.map((_, i) => sum(debtSchedules.map(d => d.principal[i] + d.cashSweep[i])));
+  const fees = periods.map((_, i) => sum(debtSchedules.map(d => d.fees[i])));
+  const idc = periods.map((p, i) => p.phase === 'construction' ? sum(debtSchedules.map(d => d.capitalizedInterest[i])) : 0);
+  const debtDraws = periods.map((_, i) => sum(debtSchedules.map(d => d.drawdown[i])));
+  const closingDebt = periods.map((_, i) => sum(debtSchedules.map(d => d.closingBalance[i])));
+  const cfads = operating.cfadsBeforeDebt;
+  const covenants = buildCovenants(project, cfads, principal.map((p, i) => p + interest[i]), closingDebt);
+  const dsra = reserveSchedule.closingBalance;
+  const constructionCount = periods.filter(p => p.phase === 'construction').length || 1;
+  const grantContrib = periods.map(p => p.phase === 'construction' ? grantAmount / constructionCount : 0);
+  const equityContrib = periods.map(p => p.phase === 'construction' ? fundingSummary.equityFunding / constructionCount : 0);
+  const distributions: number[] = [];
+  const closingCash: number[] = [];
+  let cash = 0;
+  periods.forEach((period, i) => {
+    cash += cfads[i] - interest[i] - principal[i] - reserveSchedule.topUp[i] + reserveSchedule.release[i] - construction.draw[i] + debtDraws[i] + equityContrib[i] + grantContrib[i] - fees[i];
+    const locked = period.phase === 'construction' || covenants.distributionLocked[i] || cash < project.covenants.minimumCash;
+    distributions[i] = locked ? 0 : Math.max(0, cash - project.covenants.minimumCash);
+    cash -= distributions[i];
+    closingCash[i] = cash;
+  });
+
+  const statements = buildStatements({ periods, revenue: operating.revenue, operatingCosts: operating.operatingCosts, ebitda: operating.ebitda, depreciation: operating.depreciation, interest, tax: operating.tax, maintenance: operating.maintenanceCapex, wc: operating.workingCapital, constructionDraw: construction.draw, debtSchedules, dsra, distributions, closingCash, equityContrib, grants: grantContrib });
+  const dscrs = dscr(cfads, principal.map((p, i) => p + interest[i]));
+  const finiteDscr = dscrs.filter(Number.isFinite);
+  const totalDebt = sum(Object.values(fundingSummary.debtAllocation));
+  const totalFees = sum(fees);
+  const totalIdc = sum(idc);
+  const balanceSheetBalanced = statements.balanceCheck.every(x => Math.abs(x) < 1.5);
+  const warnings = [
+    ...validation.filter(v => v.severity === 'warning').map(v => v.message),
+    ...(failed ? ['Funding circularity solver failure.'] : []),
+    ...(!fundingSummary.balanced ? ['Sources and uses are not balanced.'] : []),
+    ...(!balanceSheetBalanced ? ['Balance sheet not balancing.'] : []),
+  ];
+  const sourcesUses = buildSourcesUses(fundingSummary);
+  const waterfall = {
+    Revenue: operating.revenue,
+    'Operating costs': operating.operatingCosts.map(x => -x),
+    EBITDA: operating.ebitda,
+    Tax: operating.tax.map(x => -x),
+    'Maintenance capex': operating.maintenanceCapex.map(x => -x),
+    'Working capital movement': operating.workingCapital.map(x => -x),
+    CFADS: cfads,
+    'Senior debt interest': periods.map((_, i) => -sum(debtSchedules.filter(d => d.seniority === 'senior').map(d => d.interest[i]))),
+    'Senior debt principal': periods.map((_, i) => -sum(debtSchedules.filter(d => d.seniority === 'senior').map(d => d.principal[i] + d.cashSweep[i]))),
+    'Senior fees': fees.map(x => -x),
+    'DSRA top-up': reserveSchedule.topUp.map(x => -x),
+    'Mezzanine interest': periods.map((_, i) => -sum(debtSchedules.filter(d => d.seniority === 'mezzanine').map(d => d.interest[i]))),
+    'Mezzanine principal': periods.map((_, i) => -sum(debtSchedules.filter(d => d.seniority === 'mezzanine').map(d => d.principal[i] + d.cashSweep[i]))),
+    'Shareholder loan interest': periods.map((_, i) => -sum(debtSchedules.filter(d => d.type === 'Shareholder loan').map(d => d.interest[i]))),
+    'Shareholder loan principal': periods.map((_, i) => -sum(debtSchedules.filter(d => d.type === 'Shareholder loan').map(d => d.principal[i] + d.cashSweep[i]))),
+    'Cash sweep': periods.map((_, i) => -sum(debtSchedules.map(d => d.cashSweep[i]))),
+    'Reserve top-ups': reserveSchedule.topUp.map(x => -x),
+    Distributions: distributions.map(x => -x),
+    'Closing cash': closingCash,
+  };
+
+  return {
+    periods,
+    revenue: operating.revenue,
+    operatingCosts: operating.operatingCosts,
+    ebitda: operating.ebitda,
+    cfads,
+    constructionDraw: construction.draw,
+    debtDraws,
+    fees,
+    idc,
+    principal,
+    interest,
+    closingDebt,
+    dsra,
+    distributions,
+    closingCash,
+    dscr: dscrs,
+    llcr: Math.min(...covenants.llcr.filter(Number.isFinite), Infinity),
+    plcr: Math.min(...covenants.plcr.filter(Number.isFinite), Infinity),
+    projectIrr: irr([-construction.totalCapex, ...cfads]),
+    equityIrr: irr([-Math.max(1, fundingSummary.equityFunding), ...distributions]),
+    sourcesUses,
+    fundingSummary,
+    incomeStatement: statements.incomeStatement,
+    balanceSheet: statements.balanceSheet,
+    cashFlowStatement: statements.cashFlowStatement,
+    waterfall,
+    debtSchedules,
+    reserveSchedule,
+    covenants,
+    solver: { status: failed ? 'failed' : 'converged', iterations: log.length, tolerance, finalDelta, variables: ['Base CAPEX', 'Total uses', 'Target gearing debt', 'Debt allocation', 'IDC', 'Debt-funded fees', 'DSRA funding', 'Equity residual', 'Sources-uses balance'], bindingConstraint: `${(project.funding.targetGearing * 100).toFixed(1)}% target gearing on total uses`, failureReason: failed ? 'Funding circularity not converging; review gearing, fees, DSRA and debt allocation caps.' : undefined, warnings, log },
+    validation,
+    warnings,
+    balanceCheck: statements.balanceCheck,
+    dashboard: { totalSources: fundingSummary.totalSources, totalUses: fundingSummary.totalUses, totalDebt, equityRequirement: fundingSummary.equityFunding, idc: totalIdc, fees: totalFees, dsra: Math.max(...dsra, 0), minDSCR: finiteDscr.length ? Math.min(...finiteDscr) : Infinity, avgDSCR: finiteDscr.length ? sum(finiteDscr) / finiteDscr.length : Infinity, llcr: Math.min(...covenants.llcr.filter(Number.isFinite), Infinity), plcr: Math.min(...covenants.plcr.filter(Number.isFinite), Infinity), projectIrr: irr([-construction.totalCapex, ...cfads]), equityIrr: irr([-Math.max(1, fundingSummary.equityFunding), ...distributions]), balanceSheetBalanced },
+    audit,
+  };
+}
