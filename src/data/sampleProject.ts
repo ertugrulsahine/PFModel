@@ -8,6 +8,7 @@ const instrumentTypes: InstrumentType[] = [
   'Bridge loan',
   'ECA facility',
   'IFI / DFI facility',
+  'VAT facility',
   'Working capital facility',
   'DSRA LC',
   'Refinancing debt',
@@ -17,11 +18,11 @@ const instrumentTypes: InstrumentType[] = [
 function seniorityFor(type: InstrumentType): Seniority {
   if (type === 'Equity') return 'equity';
   if (type === 'Mezzanine debt') return 'mezzanine';
+  if (type === 'Shareholder loan') return 'subordinated';
   return 'senior';
 }
 
 function makeInstrument(type: InstrumentType, index: number): FundingInstrument {
-  const debtLike = !['Equity', 'Grant / subsidy', 'DSRA LC'].includes(type);
   return {
     id: `inst-${index}`,
     name: type,
@@ -54,22 +55,14 @@ function makeInstrument(type: InstrumentType, index: number): FundingInstrument 
     cashSweep: type === 'Senior debt',
     refinancingEligible: type === 'Senior debt',
     covenantPackage: 'Base covenant package',
-    distributionRestrictionRules: ['No distribution during construction', 'Backward DSCR passes', 'Minimum cash balance'],
+    distributionRestrictionRules: [
+      'No distribution during construction',
+      'Backward DSCR passes',
+      'Minimum cash balance',
+    ],
     sizingMethod: type === 'Senior debt' ? 'Target DSCR' : 'Custom debt amount',
     targetDSCR: 1.35,
     maxGearing: 0.7,
-    fundingMethod:
-      type === 'Equity'
-        ? 'Residual funding / balancing item'
-        : type === 'Senior debt' || type === 'Mezzanine debt'
-          ? '% of total debt'
-          : 'Fixed amount',
-    fundingPercentage: type === 'Senior debt' ? 0.8 : type === 'Mezzanine debt' ? 0.2 : 0,
-    fundingCap: type === 'Senior debt' ? 40_000_000 : type === 'Mezzanine debt' ? 15_000_000 : 1_000_000_000_000,
-    fundingFloor: 0,
-    availableDuringConstruction: true,
-    includeInDebtSizing: debtLike,
-    residualFunding: type === 'Equity',
   };
 }
 
@@ -98,6 +91,7 @@ export const sampleProject: ProjectModel = {
     capex: 50_000_000,
     contingency: 2_500_000,
     costOverrunReserve: 1_000_000,
+    vatBridge: 500_000,
     drawdownProfile: 'straight-line',
   },
   instruments: instrumentTypes.map(makeInstrument),
@@ -143,14 +137,30 @@ export const sampleProject: ProjectModel = {
     },
   },
   scenarios: [
-    { id: 'base', name: 'Base case', revenueMultiplier: 1, opexMultiplier: 1, capexMultiplier: 1, rateShock: 0 },
-    { id: 'upside', name: 'Upside', revenueMultiplier: 1.1, opexMultiplier: 0.97, capexMultiplier: 0.98, rateShock: -0.005 },
-    { id: 'downside', name: 'Downside', revenueMultiplier: 0.9, opexMultiplier: 1.05, capexMultiplier: 1.08, rateShock: 0.01 },
+    {
+      id: 'base',
+      name: 'Base case',
+      revenueMultiplier: 1,
+      opexMultiplier: 1,
+      capexMultiplier: 1,
+      rateShock: 0,
+    },
+    {
+      id: 'upside',
+      name: 'Upside',
+      revenueMultiplier: 1.1,
+      opexMultiplier: 0.97,
+      capexMultiplier: 0.98,
+      rateShock: -0.005,
+    },
+    {
+      id: 'downside',
+      name: 'Downside',
+      revenueMultiplier: 0.9,
+      opexMultiplier: 1.05,
+      capexMultiplier: 1.08,
+      rateShock: 0.01,
+    },
   ],
   activeScenarioId: 'base',
-  funding: {
-    targetGearing: 0.7,
-    equityResidual: true,
-    tolerance: 1,
-  },
 };

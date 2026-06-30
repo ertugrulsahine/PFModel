@@ -2,15 +2,14 @@ import { sum } from './finance';
 import { DebtSchedule, Period } from './types';
 
 export function buildStatements(input: {
-  periods: Period[]; revenue: number[]; operatingCosts: number[]; ebitda: number[]; depreciation: number[]; interest: number[]; tax: number[]; maintenance: number[]; wc: number[]; constructionDraw: number[]; capitalizedFinancingCosts: number[]; debtSchedules: DebtSchedule[]; dsra: number[]; distributions: number[]; closingCash: number[]; equityContrib: number[]; grants: number[];
+  periods: Period[]; revenue: number[]; operatingCosts: number[]; ebitda: number[]; depreciation: number[]; interest: number[]; tax: number[]; maintenance: number[]; wc: number[]; constructionDraw: number[]; debtSchedules: DebtSchedule[]; dsra: number[]; distributions: number[]; closingCash: number[]; equityContrib: number[]; grants: number[];
 }) {
-  const { periods, revenue, operatingCosts, ebitda, depreciation, interest, tax, maintenance, wc, constructionDraw, capitalizedFinancingCosts, debtSchedules, dsra, distributions, closingCash, equityContrib, grants } = input;
+  const { periods, revenue, operatingCosts, ebitda, depreciation, interest, tax, maintenance, wc, constructionDraw, debtSchedules, dsra, distributions, closingCash, equityContrib, grants } = input;
   const ebit = ebitda.map((x, i) => x - depreciation[i]);
   const pbt = ebit.map((x, i) => x - interest[i]);
   const netIncome = pbt.map((x, i) => x - tax[i]);
   const accumulatedDep = periods.map((_, i) => sum(depreciation.slice(0, i + 1)));
-  const grossFixedAssets = periods.map((_, i) => sum(constructionDraw.slice(0, i + 1)) + sum(capitalizedFinancingCosts.slice(0, i + 1)));
-  const financingCostAsset = periods.map((_, i) => sum(capitalizedFinancingCosts.slice(0, i + 1)));
+  const grossFixedAssets = periods.map((_, i) => sum(constructionDraw.slice(0, i + 1)));
   const netFixedAssets = grossFixedAssets.map((x, i) => x - accumulatedDep[i]);
   const retainedEarnings: number[] = [];
   let re = 0;
@@ -32,6 +31,6 @@ export function buildStatements(input: {
     'Closing cash': closingCash,
     'Cash check': closingCash.map((c, i) => c - ((closingCash[i - 1] ?? 0) + (ebitda[i] - tax[i] - maintenance[i] - wc[i]) - constructionDraw[i] + sum(debtSchedules.map(d => d.drawdown[i] - d.principal[i] - d.cashSweep[i])) + equityContrib[i] + grants[i] - distributions[i])),
   };
-  const balanceSheet = { 'Gross fixed assets': grossFixedAssets, 'Capitalized financing costs': financingCostAsset, 'Accumulated depreciation': accumulatedDep.map(x => -x), 'Net fixed assets': netFixedAssets, Cash: closingCash, DSRA: dsra, 'Other reserves': periods.map(() => 0), 'Senior debt': seniorDebt, 'Mezzanine debt': mezzDebt, 'Shareholder loan': shlDebt, 'Other debt': otherDebt, Equity: equity, 'Grant reserve': grantReserve, 'Retained earnings': retainedEarnings, 'Balance check': balanceCheck };
+  const balanceSheet = { 'Gross fixed assets': grossFixedAssets, 'Accumulated depreciation': accumulatedDep.map(x => -x), 'Net fixed assets': netFixedAssets, Cash: closingCash, DSRA: dsra, 'Other reserves': periods.map(() => 0), 'Senior debt': seniorDebt, 'Mezzanine debt': mezzDebt, 'Shareholder loan': shlDebt, 'Other debt': otherDebt, Equity: equity, 'Grant reserve': grantReserve, 'Retained earnings': retainedEarnings, 'Balance check': balanceCheck };
   return { incomeStatement, cashFlowStatement, balanceSheet, balanceCheck, netIncome };
 }

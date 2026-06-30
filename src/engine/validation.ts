@@ -1,7 +1,6 @@
 import { ProjectModel, ValidationMessage } from './types';
-import { debtShareTotal } from './debt';
 
-const debtTypes = new Set(['Senior debt', 'Mezzanine debt', 'Bridge loan', 'ECA facility', 'IFI / DFI facility', 'Working capital facility', 'Refinancing debt', 'Shareholder loan']);
+const debtTypes = new Set(['Senior debt', 'Mezzanine debt', 'Bridge loan', 'ECA facility', 'IFI / DFI facility', 'VAT facility', 'Working capital facility', 'Refinancing debt', 'Shareholder loan']);
 const before = (a: string, b: string) => new Date(`${a}T00:00:00Z`) < new Date(`${b}T00:00:00Z`);
 
 export function validateProject(p: ProjectModel): ValidationMessage[] {
@@ -20,9 +19,6 @@ export function validateProject(p: ProjectModel): ValidationMessage[] {
     if (i.sizingMethod.includes('Gearing') && (i.maxGearing <= 0 || i.maxGearing > 1)) out.push({ severity: 'error', message: `${i.name}: invalid gearing.` });
     if (['Annuity', 'Balloon', 'Mini-perm', 'Custom repayment profile'].includes(i.repaymentType)) out.push({ severity: 'warning', message: `${i.name}: ${i.repaymentType} is not fully implemented; straight-line fallback is used.` });
   });
-  const shareTotal = debtShareTotal(p);
-  if (shareTotal > 0 && Math.abs(shareTotal - 1) > 0.0001) out.push({ severity: 'warning', message: `Debt instruments using % of total debt sum to ${(shareTotal * 100).toFixed(1)}%, not 100.0%.` });
-  if (p.funding.targetGearing < 0 || p.funding.targetGearing > 1) out.push({ severity: 'error', message: 'Target gearing must be between 0% and 100% of total uses.' });
   if (!p.reserves.some(r => r.type === 'DSRA')) out.push({ severity: 'warning', message: 'DSRA method missing.' });
   if (!p.covenants.backwardDSCR || !p.covenants.forwardDSCR || !p.covenants.llcr || !p.covenants.plcr) out.push({ severity: 'warning', message: 'Covenant thresholds missing.' });
   return out;
