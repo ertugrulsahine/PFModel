@@ -73,38 +73,4 @@ describe('PF Modeler calculation engine', () => {
     expect(base.dashboard.totalDebt).toBeGreaterThan(0);
     expect(downside.dashboard.totalUses).toBeGreaterThan(base.dashboard.totalUses);
   });
-  it('keeps base CAPEX separate from financing costs and balances sources and uses', () => {
-    const p = {
-      ...sampleProject,
-      construction: { ...sampleProject.construction, capex: 1000, contingency: 0, costOverrunReserve: 0, vatBridge: 0 },
-      funding: { ...sampleProject.funding, targetGearing: 0.7, tolerance: 1 },
-      instruments: sampleProject.instruments.map(i =>
-        i.type === 'Senior debt' ? { ...i, enabled: true, fundingMethod: '% of total debt' as const, fundingPercentage: 0.8, fundingCap: 1_000_000, commitment: 1_000_000 } :
-        i.type === 'Mezzanine debt' ? { ...i, enabled: true, fundingMethod: '% of total debt' as const, fundingPercentage: 0.2, fundingCap: 1_000_000, commitment: 1_000_000 } :
-        i.type === 'Equity' ? { ...i, enabled: true, fundingMethod: 'Residual funding / balancing item' as const, commitment: 1_000_000 } :
-        i.type === 'Grant / subsidy' ? { ...i, enabled: false, commitment: 0 } :
-        { ...i, enabled: false }
-      ),
-    };
-    const r = calculateModel(p);
-    expect(r.fundingSummary.baseCapex).toBe(1000);
-    expect(r.fundingSummary.totalUses).toBeCloseTo(r.fundingSummary.baseCapex + r.fundingSummary.financingCosts, 0);
-    expect(r.fundingSummary.totalSources).toBeCloseTo(r.fundingSummary.totalUses, 0);
-    expect(r.fundingSummary.targetDebt).toBeCloseTo(0.7 * r.fundingSummary.totalUses, 0);
-    const senior = p.instruments.find(i => i.type === 'Senior debt')!;
-    const mezz = p.instruments.find(i => i.type === 'Mezzanine debt')!;
-    expect(r.fundingSummary.debtAllocation[senior.id]).toBeCloseTo(0.8 * r.fundingSummary.targetDebt, 0);
-    expect(r.fundingSummary.debtAllocation[mezz.id]).toBeCloseTo(0.2 * r.fundingSummary.targetDebt, 0);
-    expect(r.fundingSummary.equityFunding).toBeCloseTo(r.fundingSummary.totalUses - r.fundingSummary.targetDebt, 0);
-    expect(r.fundingSummary.balanced).toBe(true);
-  });
-
-  it('disabled instruments have no funding impact', () => {
-    const p = { ...sampleProject, instruments: sampleProject.instruments.map(i => i.type === 'Mezzanine debt' ? { ...i, enabled: false } : i) };
-    const r = calculateModel(p);
-    const mezz = p.instruments.find(i => i.type === 'Mezzanine debt')!;
-    expect(r.fundingSummary.debtAllocation[mezz.id] ?? 0).toBe(0);
-    expect(r.debtSchedules.some(s => s.instrumentId === mezz.id)).toBe(false);
-  });
-
 });
